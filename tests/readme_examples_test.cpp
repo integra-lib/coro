@@ -176,10 +176,11 @@ Task<int> Average(Io& io)
     int sum      = 0;
     int count    = 0;
     auto samples = Samples(io, 4);
-    for (auto it = co_await samples.Begin(); it != samples.End(); co_await ++it)
+    for (auto it = co_await samples.Begin(); it != samples.End();)
     {
         sum += *it;
         ++count;
+        co_await ++it;
     }
     co_return count == 0 ? 0 : sum / count;
 }
@@ -227,49 +228,64 @@ TEST(ReadmeExamples, MovingBetweenThreads)
 
 // --- 7. From an interrupt to a coroutine ---------------------------------------------
 
-MpmcQueue<std::uint16_t, 16> g_adcSamples; // filled by the ADC interrupt
+MpmcQueue<std::uint16_t, 16> g_adcSamples;  // filled by the ADC interrupt
+std::atomic<std::uint32_t> g_adcDropped{0}; // what it had to throw away
 
 void AdcInterrupt(std::uint16_t sample)
 {
-    // Never waits: fails, as if full, if the consumer holds the lock right now.
-    std::ignore = g_adcSamples.TryPush(std::uint16_t{sample});
+    // Never waits: fails, as if full, while the consumer holds the lock — so count
+    // the loss rather than hide it.
+    if (!g_adcSamples.TryPush(std::uint16_t{sample}))
+    {
+        ++g_adcDropped;
+    }
 }
 
-Task<int> CollectSamples(Io& io, int wanted)
+Task<int> CollectSamples(Io& io, const std::atomic<bool>& adcStopped)
 {
     int sum = 0;
-    for (int got = 0; got < wanted;)
+    for (;;)
     {
         if (const auto sample = g_adcSamples.TryPop(); sample.has_value())
         {
             sum += *sample;
-            ++got;
+        }
+        else if (adcStopped.load())
+        {
+            co_return sum; // stopped and drained
         }
         else
         {
             co_await io.ScheduleAfter(1ms); // nothing yet: let the thread do other work
         }
     }
-    co_return sum;
 }
 
 TEST(ReadmeExamples, FromAnInterrupt)
 {
     Io io;
     BinaryEvent done;
+    std::atomic<bool> adcStopped{false};
+    std::atomic<int> accepted{0};
     int sum = 0;
     {
         IoThread thread{io};
-        std::jthread interrupts{[] {
+        std::jthread interrupts{[&] {
             for (std::uint16_t sample = 1; sample <= 8; ++sample)
             {
+                const std::uint32_t droppedBefore = g_adcDropped.load();
                 AdcInterrupt(sample);
+                if (g_adcDropped.load() == droppedBefore)
+                {
+                    accepted += sample;
+                }
                 std::this_thread::sleep_for(1ms);
             }
+            adcStopped = true;
         }};
-        sum = SyncWait(ScheduleOn(io, CollectSamples(io, 8)), done);
+        sum = SyncWait(ScheduleOn(io, CollectSamples(io, adcStopped)), done);
     }
-    EXPECT_EQ(sum, 36);
+    EXPECT_EQ(sum, accepted.load()); // every accepted sample arrives exactly once
 }
 
 // --- 8. Errors ------------------------------------------------------------------------

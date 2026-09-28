@@ -64,7 +64,7 @@ int main()
 | `WhenAllReady(a, b, …)` | awaits all; a tuple of `WhenAllTask` whose `Result()` gives each value or rethrows |
 | `AsyncScope` | `Spawn()` starts work and forgets it, `co_await Join()` waits for all of it; `Spawn()` after `Join()`, or destroying the scope with work running, ends the program |
 | `ScheduleOn(scheduler, awaitable)` | a task that first moves onto the scheduler |
-| `AsyncGenerator<T>` | `for (auto it = co_await g.Begin(); it != g.End(); co_await ++it)` |
+| `AsyncGenerator<T>` | `for (auto it = co_await g.Begin(); it != g.End();) { …; co_await ++it; }` |
 | `IoService<Semaphore, Clock>` | `Schedule()`, `ScheduleAt()`, `ScheduleAfter()`; `Run(stop, maxSleep)`, `Wake()` |
 | `SpscQueue<T, N>`, `MpmcQueue<T, N>` | bounded, N a power of two; `TryPush(T&&)`, `TryPop()`; SPSC also blocking `Push`/`Pop` |
 | `ThisCoroutine()`, `Awaitable`, `AwaitableTraits` | the handle of the calling coroutine; the concepts |
@@ -192,10 +192,11 @@ Task<int> Average(Io& io)
     int sum = 0;
     int count = 0;
     auto samples = Samples(io, 4);
-    for (auto it = co_await samples.Begin(); it != samples.End(); co_await ++it)
+    for (auto it = co_await samples.Begin(); it != samples.End();)
     {
         sum += *it;
         ++count;
+        co_await ++it; // in the body: GCC 13 rejects it as the loop's increment in a template
     }
     co_return count == 0 ? 0 : sum / count;
 }
@@ -222,29 +223,36 @@ Task<> SaveSettings(Io& fast, Io& slow, Settings settings)
 
 ```cpp
 MpmcQueue<std::uint16_t, 16> g_adcSamples;
+std::atomic<std::uint32_t> g_adcDropped{0};
 
 void AdcInterrupt(std::uint16_t sample)
 {
-    // Never waits: fails, as if full, if the consumer holds the lock right now.
-    std::ignore = g_adcSamples.TryPush(std::uint16_t{sample});
+    // Never waits: fails, as if full, while the consumer holds the lock — so count
+    // the loss rather than hide it.
+    if (!g_adcSamples.TryPush(std::uint16_t{sample}))
+    {
+        ++g_adcDropped;
+    }
 }
 
-Task<int> CollectSamples(Io& io, int wanted)
+Task<int> CollectSamples(Io& io, const std::atomic<bool>& adcStopped)
 {
     int sum = 0;
-    for (int got = 0; got < wanted;)
+    for (;;)
     {
         if (const auto sample = g_adcSamples.TryPop(); sample.has_value())
         {
             sum += *sample;
-            ++got;
+        }
+        else if (adcStopped.load())
+        {
+            co_return sum;   // stopped and drained
         }
         else
         {
             co_await io.ScheduleAfter(1ms);   // nothing yet: let the thread do other work
         }
     }
-    co_return sum;
 }
 ```
 
@@ -335,6 +343,9 @@ void IoThread(void*, void*, void*)
   an implementation that masks interrupts.
 * `MpmcQueue` never waits: its `TryPush`/`TryPop` fail, as if full or empty, while
   another context holds its lock, which makes them safe from an interrupt.
+* **GCC 13 rejects `co_await` in a `for` loop's increment inside a template**
+  ("insufficient contextual information to determine type"); GCC 15 and clang
+  accept it. Put `co_await ++it;` at the end of the loop body, as the examples do.
 * **clang reuses `std::this_thread::get_id()` across a `co_await`** at `-O1` and
   above — it treats `pthread_self()` as constant — although the coroutine may have
   moved to another thread there. The tests caught it; read thread identity, and

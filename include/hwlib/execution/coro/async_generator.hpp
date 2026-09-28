@@ -181,7 +181,11 @@ private:
 
 /// A coroutine that co_yields values the consumer awaits one at a time:
 ///
-///     for (auto it = co_await gen.Begin(); it != gen.End(); co_await ++it) { use(*it); }
+///     for (auto it = co_await gen.Begin(); it != gen.End();)
+///     {
+///         use(*it);
+///         co_await ++it; // here, not as the increment: GCC 13 rejects that in a template
+///     }
 ///
 /// Values are references into the generator's frame, valid until the next `++`.
 /// `AsyncGenerator<T&&>` behaves as `AsyncGenerator<T>`; a139's own `T&&`

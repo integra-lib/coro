@@ -31,9 +31,10 @@ template<typename T>
 Task<std::vector<T>> Collect(AsyncGenerator<T> generator)
 {
     std::vector<T> values;
-    for (auto it = co_await generator.Begin(); it != generator.End(); co_await ++it)
+    for (auto it = co_await generator.Begin(); it != generator.End();)
     {
         values.push_back(*it);
+        co_await ++it; // in the body: GCC 13 rejects it as the loop's increment in a template
     }
     co_return values;
 }
@@ -66,9 +67,10 @@ TEST(AsyncGenerator, ReferencesReachTheYieldedObjects)
     };
     auto body = [&]() -> Task<> {
         auto generator = refs(values);
-        for (auto it = co_await generator.Begin(); it != generator.End(); co_await ++it)
+        for (auto it = co_await generator.Begin(); it != generator.End();)
         {
             *it *= 10;
+            co_await ++it;
         }
     };
     InlineEvent event;
@@ -87,9 +89,10 @@ TEST(AsyncGenerator, TheGeneratorMayAwaitBetweenValues)
     std::vector<int> got;
     auto body = [&]() -> Task<> {
         auto generator = slow(suspender);
-        for (auto it = co_await generator.Begin(); it != generator.End(); co_await ++it)
+        for (auto it = co_await generator.Begin(); it != generator.End();)
         {
             got.push_back(*it);
+            co_await ++it;
         }
     };
     auto consumer = body();
