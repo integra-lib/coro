@@ -94,6 +94,331 @@ awaits it — through `co_await`, `Result()` or `SyncWait()`. Built with
 `-fno-exceptions`, nothing can escape, and a coroutine whose body would throw ends
 the program; so does awaiting a moved-from `Task` (`BrokenPromise` otherwise).
 
+## A state machine next to a coroutine
+
+Firmware without coroutines writes anything that waits as a state machine: an
+`enum` of states, the fields that must survive between steps, and a `Poll()` the
+main loop calls again and again. Below are three machines and, beside each, the
+coroutine that does the same. `tests/readme_examples_test.cpp` runs both on one
+simulated clock and checks that they make the same calls at the same
+milliseconds. `Clock` is a steady `std::chrono` clock, `Io` an `IoService`, and
+the constants (`CONVERSION_TIME`, `FLASHES`, …) durations and counts.
+
+### A measurement with retries
+
+Start a conversion, wait for it, read; if the start or the read fails, wait and
+try again, three attempts in all.
+
+<table>
+<tr><th>State machine</th><th>Coroutine</th></tr>
+<tr>
+<td valign="top">
+
+```cpp
+class Measurement
+{
+public:
+    explicit Measurement(Sensor& sensor)
+        : m_sensor{sensor}
+    {}
+
+    /// Called from the main loop, again and again; true once Result() is final.
+    bool Poll(Clock::time_point now)
+    {
+        switch (m_state)
+        {
+        case State::eBackoff:
+            if (now < m_deadline)
+            {
+                break;
+            }
+            [[fallthrough]];
+        case State::eStart:
+            if (m_sensor.StartConversion())
+            {
+                m_deadline = now + CONVERSION_TIME;
+                m_state    = State::eConverting;
+            }
+            else
+            {
+                Retry(now);
+            }
+            break;
+        case State::eConverting:
+            if (now < m_deadline)
+            {
+                break;
+            }
+            m_result = m_sensor.Read();
+            if (m_result.has_value())
+            {
+                m_state = State::eDone;
+            }
+            else
+            {
+                Retry(now);
+            }
+            break;
+        case State::eDone: break;
+        }
+        return m_state == State::eDone;
+    }
+
+    [[nodiscard]] std::optional<int> Result() const
+    {
+        return m_result;
+    }
+
+private:
+    enum class State : std::uint8_t
+    {
+        eStart,
+        eConverting,
+        eBackoff,
+        eDone,
+    };
+
+    void Retry(Clock::time_point now)
+    {
+        m_deadline = now + RETRY_DELAY;
+        m_state    = ++m_attempt < MAX_ATTEMPTS ? State::eBackoff : State::eDone;
+    }
+
+    Sensor& m_sensor;
+    State m_state{State::eStart};
+    int m_attempt{0};
+    Clock::time_point m_deadline{};
+    std::optional<int> m_result;
+};
+```
+
+</td>
+<td valign="top">
+
+```cpp
+Task<std::optional<int>> Measure(Io& io, Sensor& sensor)
+{
+    for (int attempt = 0; attempt < MAX_ATTEMPTS; ++attempt)
+    {
+        if (attempt > 0)
+        {
+            co_await io.ScheduleAfter(RETRY_DELAY);
+        }
+        if (sensor.StartConversion())
+        {
+            co_await io.ScheduleAfter(CONVERSION_TIME);
+            if (auto value = sensor.Read(); value.has_value())
+            {
+                co_return value;
+            }
+        }
+    }
+    co_return std::nullopt;
+}
+```
+
+</td>
+</tr>
+</table>
+
+The machine's `m_state`, `m_attempt` and `m_deadline` are, in the coroutine, the
+line it stopped at, the loop variable and the timer it awaits. 75 lines against
+19, and the order of the steps reads top to bottom instead of across `case` labels.
+
+### A blink pattern
+
+Three short flashes, a pause, forever.
+
+<table>
+<tr><th>State machine</th><th>Coroutine</th></tr>
+<tr>
+<td valign="top">
+
+```cpp
+class BlinkPattern
+{
+public:
+    explicit BlinkPattern(Led& led)
+        : m_led{led}
+    {}
+
+    void Poll(Clock::time_point now)
+    {
+        if (now < m_next)
+        {
+            return;
+        }
+        switch (m_state)
+        {
+        case State::eDark:
+            m_led.On();
+            m_state = State::eLit;
+            m_next  = now + ON_TIME;
+            break;
+        case State::eLit:
+            m_led.Off();
+            m_state = State::eDark;
+            if (++m_flash == FLASHES)
+            {
+                m_flash = 0;
+                m_next  = now + PAUSE;
+            }
+            else
+            {
+                m_next = now + OFF_TIME;
+            }
+            break;
+        }
+    }
+
+private:
+    enum class State : std::uint8_t
+    {
+        eDark,
+        eLit,
+    };
+
+    Led& m_led;
+    State m_state{State::eDark};
+    int m_flash{0};
+    Clock::time_point m_next{};
+};
+```
+
+</td>
+<td valign="top">
+
+```cpp
+Task<> BlinkPattern(Io& io, Led& led)
+{
+    for (;;)
+    {
+        for (int flash = 0; flash < FLASHES; ++flash)
+        {
+            if (flash > 0)
+            {
+                co_await io.ScheduleAfter(OFF_TIME);
+            }
+            led.On();
+            co_await io.ScheduleAfter(ON_TIME);
+            led.Off();
+        }
+        co_await io.ScheduleAfter(PAUSE);
+    }
+}
+```
+
+</td>
+</tr>
+</table>
+
+The machine counts flashes and knows which of two waits follows an `Off()`; the
+coroutine is two loops.
+
+### Steps made of steps
+
+Power the sensor, let it start, take the measurement above, power it off.
+
+<table>
+<tr><th>State machine</th><th>Coroutine</th></tr>
+<tr>
+<td valign="top">
+
+```cpp
+class PoweredMeasurement
+{
+public:
+    PoweredMeasurement(Sensor& sensor, PowerSwitch& power)
+        : m_measurement{sensor}
+        , m_power{power}
+    {}
+
+    bool Poll(Clock::time_point now)
+    {
+        switch (m_state)
+        {
+        case State::eOff:
+            m_power.On();
+            m_deadline = now + POWER_UP_TIME;
+            m_state    = State::ePoweringUp;
+            break;
+        case State::ePoweringUp:
+            if (now < m_deadline)
+            {
+                break;
+            }
+            m_state = State::eMeasuring;
+            [[fallthrough]];
+        case State::eMeasuring:
+            if (m_measurement.Poll(now))
+            {
+                m_power.Off();
+                m_state = State::eDone;
+            }
+            break;
+        case State::eDone: break;
+        }
+        return m_state == State::eDone;
+    }
+
+    [[nodiscard]] std::optional<int> Result() const
+    {
+        return m_measurement.Result();
+    }
+
+private:
+    enum class State : std::uint8_t
+    {
+        eOff,
+        ePoweringUp,
+        eMeasuring,
+        eDone,
+    };
+
+    Measurement m_measurement;
+    PowerSwitch& m_power;
+    State m_state{State::eOff};
+    Clock::time_point m_deadline{};
+};
+```
+
+</td>
+<td valign="top">
+
+```cpp
+Task<std::optional<int>> MeasurePowered(Io& io, Sensor& sensor,
+                                        PowerSwitch& power)
+{
+    power.On();
+    co_await io.ScheduleAfter(POWER_UP_TIME);
+    const auto value = co_await Measure(io, sensor);
+    power.Off();
+    co_return value;
+}
+```
+
+</td>
+</tr>
+</table>
+
+The machine holds the child machine as a member, forwards `Poll()` to it and
+falls through a `case` so the child starts in the same step; to measure again,
+both need a way back to their first state. The coroutine calls the child as a
+function, and measuring again is calling it again.
+
+### What each costs
+
+| | State machine | Coroutine |
+|---|---|---|
+| Where it waits | returns from `Poll()`; the loop must call it again, every tick or at its next deadline | `co_await`; `IoService` resumes it at the deadline and sleeps until then |
+| State between steps | fields, written out by hand | locals in the frame, kept by the compiler |
+| Memory | the object, where you put it | a frame from `operator new` per call (see below) |
+| Composing | a member machine, forwarded, reset by hand | `co_await Child()`, `WhenAllReady()` |
+| Seeing its state | `m_state` in a debugger or a log | where it is suspended: less visible |
+
+A machine stays the better fit where there is no heap, or where the states are
+the specification itself — a protocol whose states are named in a standard.
+
 ## Examples
 
 The examples below are compiled and run by `tests/readme_examples_test.cpp`, where

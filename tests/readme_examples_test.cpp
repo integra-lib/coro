@@ -8,10 +8,13 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <deque>
 #include <hwlib/execution/coro.hpp>
 #include <optional>
 #include <semaphore>
+#include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace
@@ -318,5 +321,526 @@ TEST(ReadmeExamples, Errors)
     EXPECT_EQ(SyncWait(Tolerant(), done), -1);
 }
 #endif
+
+// --- 9. A state machine next to a coroutine -----------------------------------------
+//
+// The same behaviour twice: once as a class polled from a main loop, once as a
+// coroutine. Both run on one simulated clock, a millisecond per step, and must make
+// the same calls at the same moments.
+
+namespace sim
+{
+
+/// A steady clock that moves only when the test says so.
+struct Clock
+{
+    using rep                       = std::int64_t;
+    using period                    = std::milli;
+    using duration                  = std::chrono::duration<rep, period>;
+    using time_point                = std::chrono::time_point<Clock>;
+    static constexpr bool is_steady = true;
+
+    static inline duration current{0};
+
+    static time_point now() noexcept
+    {
+        return time_point{current};
+    }
+};
+
+/// The service is driven by ProcessTimers() and ProcessOne(), so nothing sleeps.
+struct NoSleep
+{
+    explicit NoSleep(std::ptrdiff_t /*initial*/) noexcept {}
+
+    void release() noexcept {}
+
+    [[nodiscard]] bool try_acquire_until(Clock::time_point /*until*/) noexcept
+    {
+        return false;
+    }
+};
+
+using Io = IoService<NoSleep, Clock>;
+
+constexpr auto CONVERSION_TIME = 10ms;
+constexpr auto RETRY_DELAY     = 20ms;
+constexpr int MAX_ATTEMPTS     = 3;
+constexpr auto POWER_UP_TIME   = 5ms;
+constexpr int FLASHES          = 3;
+constexpr auto ON_TIME         = 10ms;
+constexpr auto OFF_TIME        = 10ms;
+constexpr auto PAUSE           = 50ms;
+
+/// What the fakes were asked to do, and when, on the simulated clock.
+struct Recorder
+{
+    std::vector<std::string> events;
+    std::vector<std::chrono::milliseconds> times;
+    std::chrono::milliseconds now{0};
+
+    void Note(std::string event)
+    {
+        events.push_back(std::move(event));
+        times.push_back(now);
+    }
+};
+
+/// A sensor that converts on command; scripted answers, then success.
+struct Sensor
+{
+    Recorder& recorder;
+    std::deque<bool> starts{};
+    std::deque<std::optional<int>> reads{};
+
+    bool StartConversion()
+    {
+        recorder.Note("start");
+        const bool started = starts.empty() || starts.front();
+        if (!starts.empty())
+        {
+            starts.pop_front();
+        }
+        return started;
+    }
+
+    std::optional<int> Read()
+    {
+        recorder.Note("read");
+        std::optional<int> value{42};
+        if (!reads.empty())
+        {
+            value = reads.front();
+            reads.pop_front();
+        }
+        return value;
+    }
+};
+
+struct Led
+{
+    Recorder& recorder;
+
+    void On()
+    {
+        recorder.Note("on");
+    }
+
+    void Off()
+    {
+        recorder.Note("off");
+    }
+};
+
+struct PowerSwitch
+{
+    Recorder& recorder;
+
+    void On()
+    {
+        recorder.Note("power on");
+    }
+
+    void Off()
+    {
+        recorder.Note("power off");
+    }
+};
+
+namespace machine
+{
+
+class Measurement
+{
+public:
+    explicit Measurement(Sensor& sensor)
+        : m_sensor{sensor}
+    {}
+
+    /// Called from the main loop, again and again; true once Result() is final.
+    bool Poll(Clock::time_point now)
+    {
+        switch (m_state)
+        {
+        case State::eBackoff:
+            if (now < m_deadline)
+            {
+                break;
+            }
+            [[fallthrough]];
+        case State::eStart:
+            if (m_sensor.StartConversion())
+            {
+                m_deadline = now + CONVERSION_TIME;
+                m_state    = State::eConverting;
+            }
+            else
+            {
+                Retry(now);
+            }
+            break;
+        case State::eConverting:
+            if (now < m_deadline)
+            {
+                break;
+            }
+            m_result = m_sensor.Read();
+            if (m_result.has_value())
+            {
+                m_state = State::eDone;
+            }
+            else
+            {
+                Retry(now);
+            }
+            break;
+        case State::eDone: break;
+        }
+        return m_state == State::eDone;
+    }
+
+    [[nodiscard]] std::optional<int> Result() const
+    {
+        return m_result;
+    }
+
+private:
+    enum class State : std::uint8_t
+    {
+        eStart,
+        eConverting,
+        eBackoff,
+        eDone,
+    };
+
+    void Retry(Clock::time_point now)
+    {
+        m_deadline = now + RETRY_DELAY;
+        m_state    = ++m_attempt < MAX_ATTEMPTS ? State::eBackoff : State::eDone;
+    }
+
+    Sensor& m_sensor;
+    State m_state{State::eStart};
+    int m_attempt{0};
+    Clock::time_point m_deadline{};
+    std::optional<int> m_result;
+};
+
+class BlinkPattern
+{
+public:
+    explicit BlinkPattern(Led& led)
+        : m_led{led}
+    {}
+
+    void Poll(Clock::time_point now)
+    {
+        if (now < m_next)
+        {
+            return;
+        }
+        switch (m_state)
+        {
+        case State::eDark:
+            m_led.On();
+            m_state = State::eLit;
+            m_next  = now + ON_TIME;
+            break;
+        case State::eLit:
+            m_led.Off();
+            m_state = State::eDark;
+            if (++m_flash == FLASHES)
+            {
+                m_flash = 0;
+                m_next  = now + PAUSE;
+            }
+            else
+            {
+                m_next = now + OFF_TIME;
+            }
+            break;
+        }
+    }
+
+private:
+    enum class State : std::uint8_t
+    {
+        eDark,
+        eLit,
+    };
+
+    Led& m_led;
+    State m_state{State::eDark};
+    int m_flash{0};
+    Clock::time_point m_next{};
+};
+
+class PoweredMeasurement
+{
+public:
+    PoweredMeasurement(Sensor& sensor, PowerSwitch& power)
+        : m_measurement{sensor}
+        , m_power{power}
+    {}
+
+    bool Poll(Clock::time_point now)
+    {
+        switch (m_state)
+        {
+        case State::eOff:
+            m_power.On();
+            m_deadline = now + POWER_UP_TIME;
+            m_state    = State::ePoweringUp;
+            break;
+        case State::ePoweringUp:
+            if (now < m_deadline)
+            {
+                break;
+            }
+            m_state = State::eMeasuring;
+            [[fallthrough]];
+        case State::eMeasuring:
+            if (m_measurement.Poll(now))
+            {
+                m_power.Off();
+                m_state = State::eDone;
+            }
+            break;
+        case State::eDone: break;
+        }
+        return m_state == State::eDone;
+    }
+
+    [[nodiscard]] std::optional<int> Result() const
+    {
+        return m_measurement.Result();
+    }
+
+private:
+    enum class State : std::uint8_t
+    {
+        eOff,
+        ePoweringUp,
+        eMeasuring,
+        eDone,
+    };
+
+    Measurement m_measurement;
+    PowerSwitch& m_power;
+    State m_state{State::eOff};
+    Clock::time_point m_deadline{};
+};
+
+} // namespace machine
+
+namespace coroutine
+{
+
+Task<std::optional<int>> Measure(Io& io, Sensor& sensor)
+{
+    for (int attempt = 0; attempt < MAX_ATTEMPTS; ++attempt)
+    {
+        if (attempt > 0)
+        {
+            co_await io.ScheduleAfter(RETRY_DELAY);
+        }
+        if (sensor.StartConversion())
+        {
+            co_await io.ScheduleAfter(CONVERSION_TIME);
+            if (auto value = sensor.Read(); value.has_value())
+            {
+                co_return value;
+            }
+        }
+    }
+    co_return std::nullopt;
+}
+
+Task<> BlinkPattern(Io& io, Led& led)
+{
+    for (;;)
+    {
+        for (int flash = 0; flash < FLASHES; ++flash)
+        {
+            if (flash > 0)
+            {
+                co_await io.ScheduleAfter(OFF_TIME);
+            }
+            led.On();
+            co_await io.ScheduleAfter(ON_TIME);
+            led.Off();
+        }
+        co_await io.ScheduleAfter(PAUSE);
+    }
+}
+
+Task<std::optional<int>> MeasurePowered(Io& io, Sensor& sensor, PowerSwitch& power)
+{
+    power.On();
+    co_await io.ScheduleAfter(POWER_UP_TIME);
+    const auto value = co_await Measure(io, sensor);
+    power.Off();
+    co_return value;
+}
+
+} // namespace coroutine
+
+/// Polls a machine every simulated millisecond until it is done.
+template<typename Machine>
+void PollUntilDone(Machine& machine, Recorder& recorder)
+{
+    for (recorder.now = 0ms; recorder.now < 1s; ++recorder.now)
+    {
+        if (machine.Poll(Clock::time_point{recorder.now}))
+        {
+            return;
+        }
+    }
+    FAIL() << "the machine never finished";
+}
+
+/// Runs a task on the service, a simulated millisecond per step, until it is done
+/// or `limit` has passed.
+template<typename T>
+void RunSimulated(Io& io, Task<T>& task, Recorder& recorder, std::chrono::milliseconds limit = 1s)
+{
+    task.Resume(); // queued on io by ScheduleOn()
+    for (recorder.now = 0ms; recorder.now <= limit; ++recorder.now)
+    {
+        Clock::current = recorder.now;
+        std::ignore    = io.ProcessTimers();
+        while (io.ProcessOne())
+        {}
+        if (task.IsReady())
+        {
+            return;
+        }
+    }
+}
+
+using Events = std::vector<std::string>;
+using Times  = std::vector<std::chrono::milliseconds>;
+
+/// A failed start, then a failed read, then a value: all three attempts.
+void ScriptRetries(Sensor& sensor)
+{
+    sensor.starts = {false, true, true};
+    sensor.reads  = {std::nullopt, 42};
+}
+
+const Events RETRIED        = {"start", "start", "read", "start", "read"};
+const Times RETRIED_AT      = {0ms, 20ms, 30ms, 50ms, 60ms};
+const Events GAVE_UP        = {"start", "start", "start"};
+const Times GAVE_UP_AT      = {0ms, 20ms, 40ms};
+const Events THREE_CYCLES   = {"on",  "off", "on",  "off", "on",  "off", "on",  "off", "on",
+                               "off", "on",  "off", "on",  "off", "on",  "off", "on",  "off"};
+const Times THREE_CYCLES_AT = {0ms,   10ms,  20ms,  30ms,  40ms,  50ms,  100ms, 110ms, 120ms,
+                               130ms, 140ms, 150ms, 200ms, 210ms, 220ms, 230ms, 240ms, 250ms};
+const Events POWERED        = {"power on", "start", "read", "power off"};
+const Times POWERED_AT      = {0ms, 5ms, 15ms, 15ms};
+
+TEST(ReadmeStateMachines, MeasurementRetries)
+{
+    Recorder recorder;
+    Sensor sensor{recorder};
+    ScriptRetries(sensor);
+    machine::Measurement measurement{sensor};
+    PollUntilDone(measurement, recorder);
+    EXPECT_EQ(measurement.Result(), std::optional{42});
+    EXPECT_EQ(recorder.events, RETRIED);
+    EXPECT_EQ(recorder.times, RETRIED_AT);
+}
+
+TEST(ReadmeStateMachines, MeasureRetries)
+{
+    Recorder recorder;
+    Sensor sensor{recorder};
+    ScriptRetries(sensor);
+    Io io;
+    auto task = ScheduleOn(io, coroutine::Measure(io, sensor));
+    RunSimulated(io, task, recorder);
+    ASSERT_TRUE(task.IsReady());
+    EXPECT_EQ(task.Result(), std::optional{42});
+    EXPECT_EQ(recorder.events, RETRIED);
+    EXPECT_EQ(recorder.times, RETRIED_AT);
+}
+
+TEST(ReadmeStateMachines, MeasurementGivesUp)
+{
+    Recorder recorder;
+    Sensor sensor{recorder};
+    sensor.starts = {false, false, false};
+    machine::Measurement measurement{sensor};
+    PollUntilDone(measurement, recorder);
+    EXPECT_EQ(measurement.Result(), std::nullopt);
+    EXPECT_EQ(recorder.events, GAVE_UP);
+    EXPECT_EQ(recorder.times, GAVE_UP_AT);
+}
+
+TEST(ReadmeStateMachines, MeasureGivesUp)
+{
+    Recorder recorder;
+    Sensor sensor{recorder};
+    sensor.starts = {false, false, false};
+    Io io;
+    auto task = ScheduleOn(io, coroutine::Measure(io, sensor));
+    RunSimulated(io, task, recorder);
+    ASSERT_TRUE(task.IsReady());
+    EXPECT_EQ(task.Result(), std::nullopt);
+    EXPECT_EQ(recorder.events, GAVE_UP);
+    EXPECT_EQ(recorder.times, GAVE_UP_AT);
+}
+
+TEST(ReadmeStateMachines, BlinkPatternMachine)
+{
+    Recorder recorder;
+    Led led{recorder};
+    machine::BlinkPattern pattern{led};
+    for (recorder.now = 0ms; recorder.now <= 250ms; ++recorder.now)
+    {
+        pattern.Poll(Clock::time_point{recorder.now});
+    }
+    EXPECT_EQ(recorder.events, THREE_CYCLES);
+    EXPECT_EQ(recorder.times, THREE_CYCLES_AT);
+}
+
+TEST(ReadmeStateMachines, BlinkPatternCoroutine)
+{
+    Recorder recorder;
+    Led led{recorder};
+    Io io;
+    auto task = ScheduleOn(io, coroutine::BlinkPattern(io, led));
+    RunSimulated(io, task, recorder, 250ms); // endless: stopped by the limit
+    EXPECT_EQ(recorder.events, THREE_CYCLES);
+    EXPECT_EQ(recorder.times, THREE_CYCLES_AT);
+}
+
+TEST(ReadmeStateMachines, PoweredMeasurement)
+{
+    Recorder recorder;
+    Sensor sensor{recorder};
+    PowerSwitch power{recorder};
+    machine::PoweredMeasurement measurement{sensor, power};
+    PollUntilDone(measurement, recorder);
+    EXPECT_EQ(measurement.Result(), std::optional{42});
+    EXPECT_EQ(recorder.events, POWERED);
+    EXPECT_EQ(recorder.times, POWERED_AT);
+}
+
+TEST(ReadmeStateMachines, MeasurePowered)
+{
+    Recorder recorder;
+    Sensor sensor{recorder};
+    PowerSwitch power{recorder};
+    Io io;
+    auto task = ScheduleOn(io, coroutine::MeasurePowered(io, sensor, power));
+    RunSimulated(io, task, recorder);
+    ASSERT_TRUE(task.IsReady());
+    EXPECT_EQ(task.Result(), std::optional{42});
+    EXPECT_EQ(recorder.events, POWERED);
+    EXPECT_EQ(recorder.times, POWERED_AT);
+}
+
+} // namespace sim
 
 } // namespace
