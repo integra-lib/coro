@@ -1,0 +1,10 @@
+include:
+  - project: 'internal-projects/a000-hwlib/ci-shared'
+    ref: v0.3.5
+    file: '/templates/component.yml'
+
+variables:
+  # Temporary: this project's registry has no `arch` image yet, so the jobs
+  # use bit-ops' copy, which is the same image (sha256:d3eb0864…) every other
+  # component runs on. Remove once execution/coro:arch is pushed.
+  CI_REGISTRY_IMAGE: ${CI_REGISTRY}/internal-projects/a000-hwlib/utilities/bit-ops

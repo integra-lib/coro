@@ -1,0 +1,30 @@
+# GitHub is a staging ground; GitLab is the target, and ci-shared drives the
+# pipeline there via `include: project:` (see .gitlab-ci.yml).
+#
+# This workflow is self-contained and does what it can prove: it builds the
+# coroutines and runs their tests under gcc and clang.
+
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - compiler: gcc
+            cxx: g++
+          - compiler: clang
+            cxx: clang++
+    name: build (${{ matrix.compiler }})
+    steps:
+      - uses: actions/checkout@v4
+      - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_COMPILER=${{ matrix.cxx }}
+      - run: cmake --build build -j
+      - run: ctest --test-dir build --output-on-failure
